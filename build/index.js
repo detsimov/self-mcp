@@ -1,18 +1,22 @@
 import { createServer } from "node:http";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { listFolders, listNotes, getNote, createNote, createFolder, updateNote, searchNotes, outputSchemas } from "./notes.js";
+import { listFolders, createFolder, deleteFolder } from "./models/folders.js";
+import { listNotes, getNote, createNote, updateNote, deleteNote, searchNotes } from "./models/notes.js";
+import { createReminder, listReminders, deleteReminder } from "./models/reminders.js";
+import { startReminderChecker } from "./reminder-checker.js";
 const server = new McpServer({
     name: "self-mcp",
-    version: "1.0.0",
+    version: "2.0.0",
 });
+// --- Folder tools ---
 server.registerTool("list_folders", {
-    description: "List all folders in Apple Notes",
+    description: "List all folders",
     inputSchema: z.object({}),
-    outputSchema: outputSchemas.listFolders,
+    outputSchema: z.object({ folders: z.array(z.object({ id: z.string(), name: z.string() })) }),
 }, async () => {
     try {
-        const folders = await listFolders();
+        const folders = listFolders();
         return { structuredContent: { folders }, content: [{ type: "text", text: JSON.stringify(folders, null, 2) }] };
     }
     catch (e) {
@@ -20,29 +24,50 @@ server.registerTool("list_folders", {
     }
 });
 server.registerTool("create_folder", {
-    description: "Create a new folder in Apple Notes",
+    description: "Create a new folder",
     inputSchema: z.object({
         name: z.string().describe("Name of the new folder"),
     }),
-    outputSchema: outputSchemas.createFolder,
+    outputSchema: z.object({ id: z.string(), name: z.string() }),
 }, async ({ name }) => {
     try {
-        const result = await createFolder(name);
+        const result = createFolder(name);
         return { structuredContent: result, content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
     catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
     }
 });
+server.registerTool("delete_folder", {
+    description: "Delete a folder and all its notes",
+    inputSchema: z.object({
+        id: z.string().describe("ID of the folder to delete"),
+    }),
+    outputSchema: z.object({ success: z.boolean() }),
+}, async ({ id }) => {
+    try {
+        deleteFolder(id);
+        return { structuredContent: { success: true }, content: [{ type: "text", text: "Folder deleted" }] };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    }
+});
+// --- Note tools ---
 server.registerTool("list_notes", {
-    description: "List notes in Apple Notes, optionally filtered by folder name",
+    description: "List notes, optionally filtered by folder name",
     inputSchema: z.object({
         folder: z.string().optional().describe("Folder name to filter notes (omit for all folders)"),
     }),
-    outputSchema: outputSchemas.listNotes,
+    outputSchema: z.object({
+        notes: z.array(z.object({
+            id: z.string(), name: z.string(), folder: z.string(),
+            creationDate: z.string(), modificationDate: z.string(),
+        })),
+    }),
 }, async ({ folder }) => {
     try {
-        const notes = await listNotes(folder);
+        const notes = listNotes(folder);
         return { structuredContent: { notes }, content: [{ type: "text", text: JSON.stringify(notes, null, 2) }] };
     }
     catch (e) {
@@ -54,27 +79,30 @@ server.registerTool("get_note", {
     inputSchema: z.object({
         name: z.string().describe("The title of the note to retrieve"),
     }),
-    outputSchema: outputSchemas.getNote,
+    outputSchema: z.object({
+        id: z.string(), name: z.string(), body: z.string(), folder: z.string(),
+        creationDate: z.string(), modificationDate: z.string(),
+    }),
 }, async ({ name }) => {
     try {
-        const note = await getNote(name);
-        return { structuredContent: note, content: [{ type: "text", text: JSON.stringify(note, null, 2) }] };
+        const note = getNote(name);
+        return { structuredContent: { ...note }, content: [{ type: "text", text: JSON.stringify(note, null, 2) }] };
     }
     catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
     }
 });
 server.registerTool("create_note", {
-    description: "Create a new note in Apple Notes",
+    description: "Create a new note with markdown body",
     inputSchema: z.object({
         title: z.string().describe("Title of the new note"),
-        body: z.string().describe("Body content of the note (plain text or HTML)"),
-        folder: z.string().optional().describe("Folder to create the note in (omit for default folder)"),
+        body: z.string().describe("Body content of the note (markdown)"),
+        folder: z.string().optional().describe("Folder to create the note in (omit for default 'Notes' folder)"),
     }),
-    outputSchema: outputSchemas.createNote,
+    outputSchema: z.object({ id: z.string(), name: z.string() }),
 }, async ({ title, body, folder }) => {
     try {
-        const result = await createNote(title, body, folder);
+        const result = createNote(title, body, folder);
         return { structuredContent: result, content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
     catch (e) {
@@ -85,36 +113,111 @@ server.registerTool("update_note", {
     description: "Update an existing note's content (and optionally its title)",
     inputSchema: z.object({
         name: z.string().describe("Current title of the note to update"),
-        body: z.string().describe("New body content (plain text or HTML)"),
+        body: z.string().describe("New body content (markdown)"),
         title: z.string().optional().describe("New title for the note (omit to keep current title)"),
     }),
-    outputSchema: outputSchemas.updateNote,
+    outputSchema: z.object({ id: z.string(), name: z.string() }),
 }, async ({ name, body, title }) => {
     try {
-        const result = await updateNote(name, body, title);
+        const result = updateNote(name, body, title);
         return { structuredContent: result, content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
     catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
     }
 });
+server.registerTool("delete_note", {
+    description: "Delete a note by its ID",
+    inputSchema: z.object({
+        id: z.string().describe("ID of the note to delete"),
+    }),
+    outputSchema: z.object({ success: z.boolean() }),
+}, async ({ id }) => {
+    try {
+        deleteNote(id);
+        return { structuredContent: { success: true }, content: [{ type: "text", text: "Note deleted" }] };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    }
+});
 server.registerTool("search_notes", {
-    description: "Search Apple Notes by keyword (searches both titles and content)",
+    description: "Search notes by keyword (full-text search in titles and content)",
     inputSchema: z.object({
         query: z.string().describe("Search term to find in note titles or content"),
         folder: z.string().optional().describe("Folder to search in (omit to search all folders)"),
     }),
-    outputSchema: outputSchemas.searchNotes,
+    outputSchema: z.object({
+        results: z.array(z.object({
+            id: z.string(), name: z.string(), folder: z.string(), snippet: z.string(),
+        })),
+    }),
 }, async ({ query, folder }) => {
     try {
-        const results = await searchNotes(query, folder);
+        const results = searchNotes(query, folder);
         return { structuredContent: { results }, content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
     }
     catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
     }
 });
-const PORT = Number(process.env.PORT) || 3000;
+// --- Reminder tools ---
+server.registerTool("create_reminder", {
+    description: "Create a reminder for a note. When triggered, sends a webhook notification.",
+    inputSchema: z.object({
+        noteId: z.string().describe("ID of the note to attach the reminder to"),
+        remindAt: z.string().describe("ISO datetime when to trigger the reminder (e.g. '2026-04-10T09:00:00Z')"),
+        message: z.string().optional().describe("Optional reminder message"),
+    }),
+    outputSchema: z.object({ id: z.string(), noteId: z.string(), remindAt: z.string() }),
+}, async ({ noteId, remindAt, message }) => {
+    try {
+        const result = createReminder(noteId, remindAt, message);
+        return { structuredContent: result, content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    }
+});
+server.registerTool("list_reminders", {
+    description: "List reminders, optionally filtered by note ID or upcoming only",
+    inputSchema: z.object({
+        noteId: z.string().optional().describe("Filter reminders by note ID"),
+        upcoming: z.boolean().optional().describe("Show only upcoming (not yet triggered) reminders"),
+    }),
+    outputSchema: z.object({
+        reminders: z.array(z.object({
+            id: z.string(), note_id: z.string(), remind_at: z.string(),
+            message: z.string().nullable(), triggered: z.number(),
+            triggered_at: z.string().nullable(), created_at: z.string(),
+        })),
+    }),
+}, async ({ noteId, upcoming }) => {
+    try {
+        const reminders = listReminders(noteId, upcoming);
+        return { structuredContent: { reminders }, content: [{ type: "text", text: JSON.stringify(reminders, null, 2) }] };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    }
+});
+server.registerTool("delete_reminder", {
+    description: "Delete a reminder by its ID",
+    inputSchema: z.object({
+        id: z.string().describe("ID of the reminder to delete"),
+    }),
+    outputSchema: z.object({ success: z.boolean() }),
+}, async ({ id }) => {
+    try {
+        deleteReminder(id);
+        return { structuredContent: { success: true }, content: [{ type: "text", text: "Reminder deleted" }] };
+    }
+    catch (e) {
+        return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    }
+});
+// --- Server setup ---
+const PORT = Number(process.env.PORT) || 3001;
 const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
 const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
@@ -143,6 +246,7 @@ const httpServer = createServer(async (req, res) => {
     res.end(resBody);
 });
 await server.connect(transport);
+startReminderChecker();
 httpServer.listen(PORT, () => {
     console.log(`MCP server listening on http://localhost:${PORT}/mcp`);
 });
