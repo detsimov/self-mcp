@@ -74,3 +74,18 @@ export function markTriggered(id: string): void {
     const now = new Date().toISOString();
     db.prepare("UPDATE reminders SET triggered = 1, triggered_at = ? WHERE id = ?").run(now, id);
 }
+
+export function batchDeleteReminders(ids: string[]): {deleted: string[]; errors: {id: string; error: string}[]} {
+    const deleted: string[] = [];
+    const errors: {id: string; error: string}[] = [];
+    for (const id of ids) {
+        try {
+            const result = db.prepare("DELETE FROM reminders WHERE id = ?").run(id);
+            if (result.changes === 0) errors.push({id, error: `Reminder not found: ${id}`});
+            else deleted.push(id);
+        } catch (e: any) {
+            errors.push({id, error: e.message});
+        }
+    }
+    return {deleted, errors};
+}

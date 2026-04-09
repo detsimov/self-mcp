@@ -64,4 +64,8 @@ if (!ftsExists) {
     `);
 }
 
+export function withTransaction<T>(fn: () => T): T {
+    return db.transaction(fn)();
+}
+
 export { db, randomUUID };

@@ -55,4 +55,7 @@ if (!ftsExists) {
         END;
     `);
 }
+export function withTransaction(fn) {
+    return db.transaction(fn)();
+}
 export { db, randomUUID };

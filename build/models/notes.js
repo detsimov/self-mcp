@@ -51,6 +51,63 @@ export function deleteNote(id) {
     if (result.changes === 0)
         throw new Error(`Note not found: ${id}`);
 }
+export function upsertNote(title, body, folderName) {
+    const existing = db.prepare("SELECT id FROM notes WHERE title = ?").get(title);
+    if (existing) {
+        if (body !== undefined) {
+            const now = new Date().toISOString();
+            db.prepare("UPDATE notes SET body = ?, updated_at = ? WHERE id = ?").run(body, now, existing.id);
+        }
+        return { id: existing.id, name: title, created: false };
+    }
+    const folder = folderName
+        ? getFolderByName(folderName) ?? createFolderRow(folderName)
+        : getFolderByName("Notes") ?? createFolderRow("Notes");
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO notes (id, title, body, folder_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(id, title, body ?? "", folder.id, now, now);
+    return { id, name: title, created: true };
+}
+export function getNoteWithReminders(title) {
+    const note = getNote(title);
+    const reminders = db.prepare(`
+        SELECT id, remind_at AS remindAt, message, triggered
+        FROM reminders WHERE note_id = ? ORDER BY remind_at ASC
+    `).all(note.id);
+    return { ...note, reminders };
+}
+export function getWorkspaceOverview() {
+    const folders = db.prepare("SELECT id, name FROM folders ORDER BY name").all();
+    const notes = db.prepare(`
+        SELECT n.id, n.title AS name, f.name AS folder,
+               n.created_at AS creationDate, n.updated_at AS modificationDate
+        FROM notes n JOIN folders f ON n.folder_id = f.id
+        ORDER BY n.updated_at DESC
+    `).all();
+    const upcomingReminders = db.prepare(`
+        SELECT r.id, r.remind_at AS remindAt, r.message, r.note_id AS noteId, n.title AS noteName
+        FROM reminders r JOIN notes n ON r.note_id = n.id
+        WHERE r.triggered = 0 ORDER BY r.remind_at ASC
+    `).all();
+    return { folders, notes, upcomingReminders };
+}
+export function batchDeleteNotes(ids) {
+    const deleted = [];
+    const errors = [];
+    for (const id of ids) {
+        try {
+            const result = db.prepare("DELETE FROM notes WHERE id = ?").run(id);
+            if (result.changes === 0)
+                errors.push({ id, error: `Note not found: ${id}` });
+            else
+                deleted.push(id);
+        }
+        catch (e) {
+            errors.push({ id, error: e.message });
+        }
+    }
+    return { deleted, errors };
+}
 export function searchNotes(query, folderName) {
     const ftsQuery = query.replace(/['"]/g, "").split(/\s+/).map(w => `"${w}"`).join(" ");
     if (folderName) {

@@ -1,221 +1,221 @@
 import {createServer} from "node:http";
 import {McpServer, WebStandardStreamableHTTPServerTransport} from "@modelcontextprotocol/server";
 import {z} from "zod";
-import {listFolders, createFolder, deleteFolder} from "./models/folders.js";
-import {listNotes, getNote, createNote, updateNote, deleteNote, searchNotes} from "./models/notes.js";
-import {createReminder, listReminders, deleteReminder} from "./models/reminders.js";
+import {batchDeleteFolders} from "./models/folders.js";
+import {getNote, upsertNote, searchNotes, batchDeleteNotes, getWorkspaceOverview, getNoteWithReminders} from "./models/notes.js";
+import {createReminder, batchDeleteReminders} from "./models/reminders.js";
+import {withTransaction} from "./db.js";
 import {startReminderChecker} from "./reminder-checker.js";
 
 const server = new McpServer({
     name: "self-mcp",
-    version: "2.0.0",
+    version: "3.0.0",
 });
 
-// --- Folder tools ---
+// --- Tool 1: overview ---
 
-server.registerTool("list_folders", {
-    description: "List all folders",
+server.registerTool("overview", {
+    description: "Get a workspace snapshot: all folders, notes metadata, and upcoming reminders. Call this first to orient yourself.",
     inputSchema: z.object({}),
-    outputSchema: z.object({folders: z.array(z.object({id: z.string(), name: z.string()}))}),
-}, async () => {
-    try {
-        const folders = listFolders();
-        return {structuredContent: {folders}, content: [{type: "text", text: JSON.stringify(folders, null, 2)}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
-
-server.registerTool("create_folder", {
-    description: "Create a new folder",
-    inputSchema: z.object({
-        name: z.string().describe("Name of the new folder"),
-    }),
-    outputSchema: z.object({id: z.string(), name: z.string()}),
-}, async ({name}: {name: string}) => {
-    try {
-        const result = createFolder(name);
-        return {structuredContent: result, content: [{type: "text", text: JSON.stringify(result, null, 2)}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
-
-server.registerTool("delete_folder", {
-    description: "Delete a folder and all its notes",
-    inputSchema: z.object({
-        id: z.string().describe("ID of the folder to delete"),
-    }),
-    outputSchema: z.object({success: z.boolean()}),
-}, async ({id}: {id: string}) => {
-    try {
-        deleteFolder(id);
-        return {structuredContent: {success: true}, content: [{type: "text", text: "Folder deleted"}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
-
-// --- Note tools ---
-
-server.registerTool("list_notes", {
-    description: "List notes, optionally filtered by folder name",
-    inputSchema: z.object({
-        folder: z.string().optional().describe("Folder name to filter notes (omit for all folders)"),
-    }),
     outputSchema: z.object({
+        folders: z.array(z.object({id: z.string(), name: z.string()})),
         notes: z.array(z.object({
             id: z.string(), name: z.string(), folder: z.string(),
             creationDate: z.string(), modificationDate: z.string(),
         })),
+        upcomingReminders: z.array(z.object({
+            id: z.string(), remindAt: z.string(), message: z.string().nullable(),
+            noteId: z.string(), noteName: z.string(),
+        })),
     }),
-}, async ({folder}: {folder?: string}) => {
+}, async () => {
     try {
-        const notes = listNotes(folder);
-        return {structuredContent: {notes}, content: [{type: "text", text: JSON.stringify(notes, null, 2)}]};
+        const result = getWorkspaceOverview();
+        return {structuredContent: result, content: [{type: "text", text: JSON.stringify(result, null, 2)}]};
     } catch (e: any) {
         return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
     }
 });
 
-server.registerTool("get_note", {
-    description: "Get the full content of a note by its title",
+// --- Tool 2: save_note ---
+
+const NoteItemSchema = z.object({
+    title: z.string().describe("Note title (used as upsert key)"),
+    body: z.string().optional().describe("Body content (markdown). Omit to leave existing content unchanged."),
+    folder: z.string().optional().describe("Folder name — auto-created if missing"),
+    reminder: z.object({
+        remindAt: z.string().describe("ISO datetime for the reminder"),
+        message: z.string().optional().describe("Optional reminder message"),
+    }).optional(),
+});
+
+server.registerTool("save_note", {
+    description: "Create or update notes. Single mode: pass {title, body?, folder?, reminder?}. Batch mode: pass {notes: [...]}. Upserts by title — updates if exists, creates if not. Omitting body on an existing note only adds the reminder without touching content. Auto-creates folders. Single mode runs in a transaction.",
     inputSchema: z.object({
-        name: z.string().describe("The title of the note to retrieve"),
+        title: z.string().optional().describe("Single-note mode: note title"),
+        body: z.string().optional().describe("Single-note mode: note body"),
+        folder: z.string().optional().describe("Single-note mode: folder name"),
+        reminder: z.object({
+            remindAt: z.string(),
+            message: z.string().optional(),
+        }).optional().describe("Single-note mode: optional reminder"),
+        notes: z.array(NoteItemSchema).optional().describe("Batch mode: array of notes to save"),
+    }),
+    outputSchema: z.object({
+        saved: z.array(z.object({id: z.string(), name: z.string(), created: z.boolean()})),
+        errors: z.array(z.object({title: z.string(), error: z.string()})),
+    }),
+}, async (input) => {
+    try {
+        const isBatch = !!input.notes;
+        const items = input.notes ?? (input.title ? [{
+            title: input.title,
+            body: input.body,
+            folder: input.folder,
+            reminder: input.reminder,
+        }] : null);
+
+        if (!items) {
+            return {content: [{type: "text", text: "Error: Provide 'title' (single mode) or 'notes' (batch mode)"}], isError: true};
+        }
+
+        const saved: {id: string; name: string; created: boolean}[] = [];
+        const errors: {title: string; error: string}[] = [];
+
+        if (!isBatch) {
+            // Single mode: transactional
+            try {
+                const r = withTransaction(() => {
+                    const {id, name, created} = upsertNote(items[0].title, items[0].body, items[0].folder);
+                    if (items[0].reminder) {
+                        createReminder(id, items[0].reminder.remindAt, items[0].reminder.message);
+                    }
+                    return {id, name, created};
+                });
+                saved.push(r);
+            } catch (e: any) {
+                errors.push({title: items[0].title, error: e.message});
+            }
+        } else {
+            // Batch mode: collect errors per item
+            for (const item of items) {
+                try {
+                    const {id, name, created} = upsertNote(item.title, item.body, item.folder);
+                    if (item.reminder) {
+                        createReminder(id, item.reminder.remindAt, item.reminder.message);
+                    }
+                    saved.push({id, name, created});
+                } catch (e: any) {
+                    errors.push({title: item.title, error: e.message});
+                }
+            }
+        }
+
+        const result = {saved, errors};
+        return {structuredContent: result, content: [{type: "text", text: JSON.stringify(result, null, 2)}]};
+    } catch (e: any) {
+        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
+    }
+});
+
+// --- Tool 3: find_notes ---
+
+server.registerTool("find_notes", {
+    description: "Full-text search across note titles and bodies. Returns matching notes with snippets, optionally with full body.",
+    inputSchema: z.object({
+        query: z.string().describe("Search query"),
+        folder: z.string().optional().describe("Limit search to this folder name"),
+        includeBody: z.boolean().optional().describe("Include full note body in results (default false)"),
+    }),
+    outputSchema: z.object({
+        results: z.array(z.object({
+            id: z.string(), name: z.string(), folder: z.string(),
+            snippet: z.string(), body: z.string().optional(),
+        })),
+    }),
+}, async ({query, folder, includeBody}: {query: string; folder?: string; includeBody?: boolean}) => {
+    try {
+        const matches = searchNotes(query, folder);
+        const results = includeBody
+            ? matches.map(m => ({...m, body: getNote(m.name).body}))
+            : matches;
+        const out = {results};
+        return {structuredContent: out, content: [{type: "text", text: JSON.stringify(out, null, 2)}]};
+    } catch (e: any) {
+        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
+    }
+});
+
+// --- Tool 4: get_note ---
+
+server.registerTool("get_note", {
+    description: "Get a single note's full content and all its reminders by title",
+    inputSchema: z.object({
+        name: z.string().describe("Note title"),
     }),
     outputSchema: z.object({
         id: z.string(), name: z.string(), body: z.string(), folder: z.string(),
         creationDate: z.string(), modificationDate: z.string(),
+        reminders: z.array(z.object({
+            id: z.string(), remindAt: z.string(),
+            message: z.string().nullable(), triggered: z.number(),
+        })),
     }),
 }, async ({name}: {name: string}) => {
     try {
-        const note = getNote(name);
-        return {structuredContent: {...note}, content: [{type: "text", text: JSON.stringify(note, null, 2)}]};
+        const note = getNoteWithReminders(name);
+        const out = {...note} as Record<string, unknown>;
+        return {structuredContent: out, content: [{type: "text", text: JSON.stringify(note, null, 2)}]};
     } catch (e: any) {
         return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
     }
 });
 
-server.registerTool("create_note", {
-    description: "Create a new note with markdown body",
-    inputSchema: z.object({
-        title: z.string().describe("Title of the new note"),
-        body: z.string().describe("Body content of the note (markdown)"),
-        folder: z.string().optional().describe("Folder to create the note in (omit for default 'Notes' folder)"),
-    }),
-    outputSchema: z.object({id: z.string(), name: z.string()}),
-}, async ({title, body, folder}: {title: string; body: string; folder?: string}) => {
-    try {
-        const result = createNote(title, body, folder);
-        return {structuredContent: result, content: [{type: "text", text: JSON.stringify(result, null, 2)}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
+// --- Tool 5: delete ---
 
-server.registerTool("update_note", {
-    description: "Update an existing note's content (and optionally its title)",
+server.registerTool("delete", {
+    description: "Batch delete notes, folders (cascades to notes), and/or reminders by ID",
     inputSchema: z.object({
-        name: z.string().describe("Current title of the note to update"),
-        body: z.string().describe("New body content (markdown)"),
-        title: z.string().optional().describe("New title for the note (omit to keep current title)"),
-    }),
-    outputSchema: z.object({id: z.string(), name: z.string()}),
-}, async ({name, body, title}: {name: string; body: string; title?: string}) => {
-    try {
-        const result = updateNote(name, body, title);
-        return {structuredContent: result, content: [{type: "text", text: JSON.stringify(result, null, 2)}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
-
-server.registerTool("delete_note", {
-    description: "Delete a note by its ID",
-    inputSchema: z.object({
-        id: z.string().describe("ID of the note to delete"),
-    }),
-    outputSchema: z.object({success: z.boolean()}),
-}, async ({id}: {id: string}) => {
-    try {
-        deleteNote(id);
-        return {structuredContent: {success: true}, content: [{type: "text", text: "Note deleted"}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
-
-server.registerTool("search_notes", {
-    description: "Search notes by keyword (full-text search in titles and content)",
-    inputSchema: z.object({
-        query: z.string().describe("Search term to find in note titles or content"),
-        folder: z.string().optional().describe("Folder to search in (omit to search all folders)"),
+        notes: z.array(z.string()).optional().describe("Note IDs to delete"),
+        folders: z.array(z.string()).optional().describe("Folder IDs to delete (cascades to all notes inside)"),
+        reminders: z.array(z.string()).optional().describe("Reminder IDs to delete"),
     }),
     outputSchema: z.object({
-        results: z.array(z.object({
-            id: z.string(), name: z.string(), folder: z.string(), snippet: z.string(),
-        })),
+        deleted: z.object({
+            notes: z.array(z.string()),
+            folders: z.array(z.string()),
+            reminders: z.array(z.string()),
+        }),
+        errors: z.array(z.object({id: z.string(), error: z.string()})),
     }),
-}, async ({query, folder}: {query: string; folder?: string}) => {
+}, async ({notes, folders, reminders}: {notes?: string[]; folders?: string[]; reminders?: string[]}) => {
     try {
-        const results = searchNotes(query, folder);
-        return {structuredContent: {results}, content: [{type: "text", text: JSON.stringify(results, null, 2)}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
+        const allErrors: {id: string; error: string}[] = [];
+        const deletedNotes: string[] = [];
+        const deletedFolders: string[] = [];
+        const deletedReminders: string[] = [];
 
-// --- Reminder tools ---
+        if (notes?.length) {
+            const r = batchDeleteNotes(notes);
+            deletedNotes.push(...r.deleted);
+            allErrors.push(...r.errors);
+        }
+        if (folders?.length) {
+            const r = batchDeleteFolders(folders);
+            deletedFolders.push(...r.deleted);
+            allErrors.push(...r.errors);
+        }
+        if (reminders?.length) {
+            const r = batchDeleteReminders(reminders);
+            deletedReminders.push(...r.deleted);
+            allErrors.push(...r.errors);
+        }
 
-server.registerTool("create_reminder", {
-    description: "Create a reminder for a note. When triggered, sends a webhook notification.",
-    inputSchema: z.object({
-        noteId: z.string().describe("ID of the note to attach the reminder to"),
-        remindAt: z.string().describe("ISO datetime when to trigger the reminder (e.g. '2026-04-10T09:00:00Z')"),
-        message: z.string().optional().describe("Optional reminder message"),
-    }),
-    outputSchema: z.object({id: z.string(), noteId: z.string(), remindAt: z.string()}),
-}, async ({noteId, remindAt, message}: {noteId: string; remindAt: string; message?: string}) => {
-    try {
-        const result = createReminder(noteId, remindAt, message);
+        const result = {
+            deleted: {notes: deletedNotes, folders: deletedFolders, reminders: deletedReminders},
+            errors: allErrors,
+        };
         return {structuredContent: result, content: [{type: "text", text: JSON.stringify(result, null, 2)}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
-
-server.registerTool("list_reminders", {
-    description: "List reminders, optionally filtered by note ID or upcoming only",
-    inputSchema: z.object({
-        noteId: z.string().optional().describe("Filter reminders by note ID"),
-        upcoming: z.boolean().optional().describe("Show only upcoming (not yet triggered) reminders"),
-    }),
-    outputSchema: z.object({
-        reminders: z.array(z.object({
-            id: z.string(), note_id: z.string(), remind_at: z.string(),
-            message: z.string().nullable(), triggered: z.number(),
-            triggered_at: z.string().nullable(), created_at: z.string(),
-        })),
-    }),
-}, async ({noteId, upcoming}: {noteId?: string; upcoming?: boolean}) => {
-    try {
-        const reminders = listReminders(noteId, upcoming);
-        return {structuredContent: {reminders}, content: [{type: "text", text: JSON.stringify(reminders, null, 2)}]};
-    } catch (e: any) {
-        return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
-    }
-});
-
-server.registerTool("delete_reminder", {
-    description: "Delete a reminder by its ID",
-    inputSchema: z.object({
-        id: z.string().describe("ID of the reminder to delete"),
-    }),
-    outputSchema: z.object({success: z.boolean()}),
-}, async ({id}: {id: string}) => {
-    try {
-        deleteReminder(id);
-        return {structuredContent: {success: true}, content: [{type: "text", text: "Reminder deleted"}]};
     } catch (e: any) {
         return {content: [{type: "text", text: `Error: ${e.message}`}], isError: true};
     }

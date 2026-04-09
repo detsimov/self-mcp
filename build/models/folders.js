@@ -16,3 +16,20 @@ export function deleteFolder(id) {
     if (result.changes === 0)
         throw new Error(`Folder not found: ${id}`);
 }
+export function batchDeleteFolders(ids) {
+    const deleted = [];
+    const errors = [];
+    for (const id of ids) {
+        try {
+            const result = db.prepare("DELETE FROM folders WHERE id = ?").run(id);
+            if (result.changes === 0)
+                errors.push({ id, error: `Folder not found: ${id}` });
+            else
+                deleted.push(id);
+        }
+        catch (e) {
+            errors.push({ id, error: e.message });
+        }
+    }
+    return { deleted, errors };
+}
